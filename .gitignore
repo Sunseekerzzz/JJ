@@ -1,0 +1,22 @@
+# ---- Build artifacts ----
+build/
+dist/
+__pycache__/
+*.pyc
+
+# ---- Binaries & distributable packages (not uploaded per request) ----
+*.exe
+*.zip
+ffmpeg/
+_internal/
+releases/
+
+# ---- Runtime state / logs ----
+crash*.log
+crash_count.txt
+smoke_result.txt
+build_v6_log.txt
+config.json
+
+# ---- Test media (large, not source) ----
+repro_videos/
