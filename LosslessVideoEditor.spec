@@ -5,6 +5,8 @@ a = Analysis(
     ['lossless_editor.py'],
     pathex=[],
     binaries=[],
+    # 自包含 onedir: 内置 ffmpeg-bundle.zip(含 ffmpeg/ffprobe/ffplay 三件套),
+    # 编辑器首次启动会从 _internal/ffmpeg_bundle 解压到 ffmpeg/bin。
     datas=[('ffmpeg-bundle.zip', 'ffmpeg_bundle')],
     hiddenimports=[],
     hookspath=[],

@@ -17,6 +17,7 @@
 
 import glob
 import json
+import ctypes
 import os
 import queue
 import re
@@ -84,6 +85,7 @@ COL_END = "#19a974"         # 终点手柄 青
 COL_PLAY = "#e03131"        # 播放头 红
 COL_PREVIEW_BG = "#000000"  # 预览画布
 COL_STATUS_BG = "#26262b"   # 状态栏
+COL_PROGRESS = "#f0922d"    # 进度条填充(琥珀:语义配色"主操作/进度";色弱下对比度更好)
 
 PREVIEW_MIN_W = 360
 CACHE_LIMIT = 60
@@ -289,6 +291,11 @@ DEFAULT_CFG = {
     "last_open_dir": "",     # 上次打开视频的目录
     "last_export_dir": "",   # 上次导出目录
     "window_geometry": "",   # 窗口位置与大小
+    # v13.2 硬件加速解码开关(默认关闭)。
+    # 开启后预览抽帧 / ffplay 播放 / GIF 重编码走 GPU 解码,
+    # 4K、高码率、HEVC/AV1 等重解码素材收益明显;
+    # 轻量小文件反而可能略慢(GPU 初始化开销),故默认关闭、按需开启。
+    "hwaccel": False,
 }
 
 
@@ -359,13 +366,16 @@ def humanize_ffmpeg_error(tail):
 class FFmpegAPI:
     """封装 ffmpeg / ffprobe / ffplay 的调用"""
 
-    def __init__(self, bindir):
+    def __init__(self, bindir, hw_args=None):
         self.bindir = bindir
         self.ffmpeg = ff_join(bindir, "ffmpeg")
         self.ffprobe = ff_join(bindir, "ffprobe")
         self.ffplay = ff_join(bindir, "ffplay")
         self.has_ffplay = os.path.isfile(self.ffplay)
         self.last_err = ""  # 最近一次 probe 失败的具体原因
+        # v13.2 硬件加速解码参数(解码侧,如 ['-hwaccel','auto'] 或 [])。
+        # 由 App 按 config.json 的 hwaccel 开关注入;只影响"解码",不改变输出画质。
+        self.hw_args = list(hw_args or [])
 
     def probe(self, path):
         """解析视频信息,返回 dict;失败返回 None 并记录 self.last_err"""
@@ -431,9 +441,10 @@ class FFmpegAPI:
         }
 
     def grab_frame(self, path, t, width, out_png, timeout=15):
-        """用快速 seek 抽一帧为 PNG(scale 到指定宽度)"""
+        """用快速 seek 抽一帧为 PNG(scale 到指定宽度;可选 GPU 硬解)"""
         cmd = [
             self.ffmpeg, "-y", "-loglevel", "error",
+        ] + list(self.hw_args) + [
             "-ss", "%.3f" % max(0.0, t),
             "-i", path,
             "-frames:v", "1",
@@ -487,7 +498,9 @@ class Timeline(Canvas):
         self.bind("<Button-1>", self.on_press)
         self.bind("<B1-Motion>", self.on_drag)
         self.bind("<ButtonRelease-1>", self.on_release)
-        self.bind("<Double-Button-1>", self.on_double)
+        # v13.3:取消「双击时间轴 → 弹出精确设置」的行为(用户要求)。
+        #        双击时间轴现在等同于两次单击(即单纯的跳转定位);
+        #        精确设置仍可从顶栏「精确设置」按钮打开。
         self.bind("<Configure>", lambda e: self.draw())
 
     # ---- 坐标换算 ----
@@ -624,10 +637,6 @@ class Timeline(Canvas):
             self.drag_mode = None
             self.app.refresh_preview_now()
 
-    def on_double(self, _e):
-        if self.app.video and self.app.duration > 0:
-            self.app.open_precise_dialog()
-
 
 class App(Tk):
     def __init__(self):
@@ -672,6 +681,16 @@ class App(Tk):
         self._job_total = 0.0
         self._proc = None
         self._cancel_flag = False
+        # v13.2 通用任务进度条(导入/导出共用底部条)与预览活动指示
+        self._prog_owner = None      # 当前占用进度条的任务: export / import / play
+        self._play_poll = None       # v13.3 播放启动轮询 after id
+        self._play_feedback = False  # v13.3 本次播放是否拿到了进度条(未拿到则不抢状态栏)
+        self._grab_inflight = 0      # 在途的预览抽帧数
+        self._grab_t0 = 0.0          # 本轮抽帧起始时间(用于延迟显示)
+        self._grab_poll = None       # 抽帧活动指示的轮询 after id
+        self._pv_busy = False        # 预览解码中标记
+        self._pv_busy_after = None   # 预览活动指示动画 after id
+        self._pv_busy_dots = 0
         # v10:预览联动最新帧序号(丢弃过期抽帧) / 播放速度 / 待打开文件(命令行)
         self._preview_seq = 0
         self._pv_live_last = 0.0
@@ -838,6 +857,13 @@ class App(Tk):
             400, 220, text="打开一个视频文件后,这里会显示预览帧\n\n"
                            "拖动下方时间轴即可选择要保留的区间",
             fill="#4d5661", font=self.font_info, justify="center", tags="hint")
+        # v13.2 预览"解码中"活动指示:用 place() 浮在画布左上角。
+        # 用独立 Label 而非画布 item —— _pv_draw() 每次 delete("all") 会擦掉画布元素,
+        # place 的子控件不受影响,且不参与布局,不会引起界面抖动。
+        self.pv_busy = Label(self.cv, text="◌ 解码中", bg=COL_STATUS_BG,
+                             fg=COL_ACCENT, font=self.font_small,
+                             padx=8, pady=3, highlightthickness=1,
+                             highlightbackground=COL_BORDER, bd=0)
         # ⑥:预览缩放交互 —— 滚轮缩放(以鼠标为中心) / 双击恢复 100% / 放大后按住拖动平移
         self.cv.bind("<MouseWheel>", self._on_preview_wheel)
         self.cv.bind("<Double-Button-1>", self._on_preview_double)
@@ -872,6 +898,19 @@ class App(Tk):
             activeforeground=COL_TEXT, selectcolor=COL_ENTRY,
             highlightthickness=0, bd=0, font=self.font_small)
         self.chk_precise.pack(side="left", padx=(12, 0))
+        # v13.2 硬件加速解码开关(默认关闭,状态存 config.json)
+        self.hw_var = BooleanVar(value=bool(self.cfg.get("hwaccel", False)))
+        self.chk_hw = Checkbutton(
+            ctrl, text="硬件加速解码", variable=self.hw_var,
+            command=self._on_hw_toggle,
+            bg=COL_BG, fg=COL_TEXT, activebackground=COL_BG,
+            activeforeground=COL_TEXT, selectcolor=COL_ENTRY,
+            highlightthickness=0, bd=0, font=self.font_small)
+        self.chk_hw.pack(side="left", padx=(12, 0))
+        # 鼠标悬停提示(ttk/tk 无原生 tooltip,用状态栏提示代替)
+        self.chk_hw.bind("<Enter>", lambda e: self.set_status(
+            "硬件加速解码:开启后预览/播放走 GPU 解码,适合 4K / 高码率素材(默认关闭)"))
+        self.chk_hw.bind("<Leave>", lambda e: self.set_status(""))
         # v11:播放速度选择(自定义深色风格下拉,0.25x~2x 六档)
         self.SPEED_VALUES = ("0.25x", "0.5x", "0.75x", "1x", "1.5x", "2x")
         self.lbl_speed = self._label(ctrl, "倍速", fg=COL_TEXT_DIM)
@@ -975,14 +1014,18 @@ class App(Tk):
                             bg=COL_STATUS_BG, fg="#cfd6de", font=self.font_small)
         self.status.pack(side="right", padx=10, pady=6)
 
-        # ---------- 导出进度条(④:平时隐藏,导出时显示到状态栏上方) ----------
+        # ---------- 任务进度条(④ 导出 / v13.2 导入 共用;平时隐藏) ----------
         self.prog_bar_frame = Frame(self, bg=COL_PANEL, height=36)
         self.prog_bar_frame.pack_propagate(False)
+        self.prog_lbl = Label(self.prog_bar_frame, text="", bg=COL_PANEL,
+                              fg=COL_TEXT, font=self.font_small, anchor="w",
+                              width=24)
+        self.prog_lbl.pack(side="left", padx=(12, 8), pady=10)
         self.prog_bar = ttk_progressbar(self.prog_bar_frame, length=340, maximum=100)
-        self.prog_bar.pack(side="left", padx=12, pady=10)
-        self.btn_cancel = self._btn(self.prog_bar_frame, "✕ 取消导出",
+        self.prog_bar.pack(side="left", pady=10)
+        self.btn_cancel = self._btn(self.prog_bar_frame, "✕ 取消",
                                     self.cancel_job, register=False)
-        self.btn_cancel.pack(side="left", padx=(8, 0), pady=7)
+        self.btn_cancel.pack(side="left", padx=(10, 0), pady=7)
         self.prog_bar_frame.pack_forget()  # 默认隐藏
 
         # 初始按钮状态
@@ -1093,12 +1136,40 @@ class App(Tk):
         self.speed_var.set(val)
         self.speed_box.config(text=val + " \u25be")
 
+    # ================= v13.2 硬件加速解码开关 =================
+    def _hw_args(self):
+        """当前硬件加速参数:开启返回 ['-hwaccel','auto'],否则空。
+        只作用于"解码侧"(-i 之前),输出仍由 -c copy / 软件滤镜决定,
+        因此不会改变无损导出的画质。"""
+        try:
+            if self.hw_var.get():
+                return ["-hwaccel", "auto"]
+        except Exception:
+            pass
+        return []
+
+    def _on_hw_toggle(self):
+        """开关切换:写回 config.json 并同步给 ffmpeg 封装"""
+        on = bool(self.hw_var.get())
+        args = self._hw_args()
+        self.cfg["hwaccel"] = on
+        save_config(self.cfg)
+        if self.ffapi:
+            self.ffapi.hw_args = args
+        if on:
+            self.log("硬件加速解码:已开启 (-hwaccel auto) —— 预览/播放/重编码走 GPU;"
+                     "4K、高码率素材更快,轻量小文件可能无差异")
+            self.set_status("硬件加速已开启并保存到配置 ✓")
+        else:
+            self.log("硬件加速解码:已关闭 (软件解码,兼容性最好)")
+            self.set_status("硬件加速已关闭并保存到配置 ✓")
+
     # ================= ffmpeg 检测/内置解压/下载 =================
     def ensure_ffmpeg(self):
         d = find_ffmpeg_dir()
         if d:
             self.ffdir = d
-            self.ffapi = FFmpegAPI(d)
+            self.ffapi = FFmpegAPI(d, self._hw_args())
             self.set_status("ffmpeg 就绪: %s" % os.path.join(d, "ffmpeg.exe"))
             return
         # 优先尝试内置 ffmpeg(打包进 exe,免下载、免联网)
@@ -1201,7 +1272,7 @@ class App(Tk):
                         if val is None:
                             win.destroy()
                             self.ffdir = dst
-                            self.ffapi = FFmpegAPI(dst)
+                            self.ffapi = FFmpegAPI(dst, self._hw_args())
                             self.set_status("ffmpeg 就绪 ✓ (内置,已解压)")
                             self.log("内置 ffmpeg 已解压到 %s" % dst)
                         else:
@@ -1304,7 +1375,7 @@ class App(Tk):
                         if val is None:
                             win.destroy()
                             self.ffdir = os.path.join(FFMPEG_DIR, "bin")
-                            self.ffapi = FFmpegAPI(self.ffdir)
+                            self.ffapi = FFmpegAPI(self.ffdir, self._hw_args())
                             self.set_status("ffmpeg 下载并安装成功 ✓")
                             self.log("ffmpeg 已安装到 %s" % self.ffdir)
                             messagebox.showinfo("完成", "ffmpeg 已就绪,可以开始使用了。")
@@ -1345,6 +1416,9 @@ class App(Tk):
             return
         self._load_gen += 1
         gen = self._load_gen
+        # v13.2 导入反馈:ffprobe 解析时长不可预知 → 不确定型进度条(来回滚动)
+        self._prog_begin("import", "解析视频信息…", determinate=False)
+        self._pv_busy_set(False)
         self.set_status("正在解析视频信息…")
         self.cv.delete("hint")
         self.cv.create_text(
@@ -1373,6 +1447,7 @@ class App(Tk):
                 self.after(50, poll)
                 return
             if kind == "err":
+                self._prog_end("import")
                 self.set_status("")
                 messagebox.showerror("无法打开视频", "解析进程异常:\n%s" % info)
                 return
@@ -1381,6 +1456,7 @@ class App(Tk):
         self.after(50, poll)
 
     def _finish_load(self, path, info, keep_segments, done_cb=None):
+        self._prog_end("import")  # 解析结束,收起导入进度条
         if info is None:
             self.set_status("")
             why = (self.ffapi.last_err or "").strip() or "未知原因"
@@ -1545,6 +1621,8 @@ class App(Tk):
                 ok = False
             q.put((ok, png))
 
+        # v13.2 抽帧在途 → 计入活动计数(超 250ms 才浮出"解码中"指示)
+        self._grab_begin()
         threading.Thread(target=worker, daemon=True).start()
 
         def poll():
@@ -1553,6 +1631,7 @@ class App(Tk):
             except queue.Empty:
                 self.after(50, poll)
                 return
+            self._grab_end()
             self._on_frame(ok, png2, key, callback)
 
         self.after(50, poll)
@@ -1700,18 +1779,26 @@ class App(Tk):
             messagebox.showwarning("提示", "当前 ffmpeg 版本未附带 ffplay 播放器,\n无法播放预览。")
             return
         if not self.video:
+            messagebox.showinfo("提示", "请先打开一个视频文件,再使用「播放选区」。")
             return
-        # 播放起点取「播放头」与「选区起点」的较大者,并限制不超过选区终点:
-        # 播放头在选区内 → 从播放头播;在选区外(更早) → 从选区起点播
-        start = max(self.playhead_t, self.start_t)
-        start = min(start, self.end_t)
-        if self.end_t - start < 0.001:
-            return  # 起点已在选区末尾,无内容可播
+        # v13.4:「播放选区」= 播放**框选的那一段**,永远从选区起点播到选区终点。
+        # v13.3 及以前写作 start = max(播放头, 选区起点):只要用户在时间轴上点过一下
+        # (移动播放头做单帧预览),播放就从那个"插针"位置开始,而不是框选范围的起点,
+        # 与按钮语义不符(用户报的正是这个)。
+        start = self.start_t
+        end = self.end_t
+        if end - start < 0.001:
+            # v13.3:以前这里是静默 return —— 用户会以为"点了没反应"。
+            messagebox.showinfo(
+                "提示", "当前选区为空(起点 = 终点),没有可播放的内容。\n\n"
+                        "请在时间轴上拖出端点、框选一段区间后重试。")
+            return
         cmd = [
             self.ffapi.ffplay,
             "-autoexit", "-window_title", "无损预览",
+        ] + list(self.ffapi.hw_args) + [
             "-ss", "%.3f" % start,
-            "-t", "%.3f" % (self.end_t - start),
+            "-t", "%.3f" % (end - start),
             "-i", self.video,
         ]
         # v10:播放速度(0.5x / 1x / 2x,ffplay 的 -speed 参数)
@@ -1721,9 +1808,90 @@ class App(Tk):
                 cmd = cmd[:1] + ["-speed", "%.2f" % speed] + cmd[1:]
         except (ValueError, AttributeError):
             pass
-        subprocess.Popen(cmd, creationflags=CREATE_NO_WINDOW)
-        self.log("播放预览: %s → %s (从播放头起, %s)"
-                 % (fmt_time(start), fmt_time(self.end_t), self.speed_var.get() or "1x"))
+        # v13.3:ffplay 是独立进程,从 Popen 到窗口真正出现有 0.5~3s 延迟
+        #        (进程启动 + seek + 首帧解码),期间界面毫无反馈 → 显得"点了没反应"。
+        #        这里立刻给出进度条 + 状态栏,窗口一出现就自动收起。
+        self._play_begin()
+        try:
+            proc = subprocess.Popen(cmd, creationflags=CREATE_NO_WINDOW)
+        except Exception as e:
+            self._play_end()
+            messagebox.showerror("播放失败", "无法启动 ffplay:\n%s" % e)
+            return
+        self._play_watch(proc, time.time())
+        self.log("播放选区: %s → %s (选区范围, %s)"
+                 % (fmt_time(start), fmt_time(end), self.speed_var.get() or "1x"))
+
+    # ---- v13.3 播放启动反馈 ----
+    def _play_begin(self):
+        """请求进度条(导出进行中时不抢占);记录是否拿到,用于决定能否改状态栏"""
+        self._prog_begin("play", "正在启动播放器…",
+                         determinate=False, cancelable=False)
+        self._play_feedback = (getattr(self, "_prog_owner", None) == "play")
+        if self._play_feedback:
+            self.set_status("正在启动播放器…")
+
+    def _play_end(self):
+        if getattr(self, "_play_poll", None):
+            try:
+                self.after_cancel(self._play_poll)
+            except Exception:
+                pass
+            self._play_poll = None
+        self._prog_end("play")
+        self._play_feedback = False
+
+    def _play_window_up(self):
+        """检测 ffplay 的「无损预览」窗口是否已创建(ctypes,零第三方依赖)"""
+        try:
+            return bool(ctypes.windll.user32.FindWindowW(None, "无损预览"))
+        except Exception:
+            return None  # 检测不可用 → 交由定时兜底
+
+    def _play_clear_status(self):
+        """清空状态栏,但绝不覆盖导出等其他任务的状态文字"""
+        if getattr(self, "_prog_owner", None) is None:
+            self.set_status("")
+
+    def _play_watch(self, proc, t0, timeout=20.0):
+        """轮询播放窗口:出现即收起反馈;进程结束/超时也收起,绝不留悬挂进度条"""
+        if getattr(self, "_play_poll", None):
+            try:
+                self.after_cancel(self._play_poll)
+            except Exception:
+                pass
+            self._play_poll = None
+        fb = bool(getattr(self, "_play_feedback", False))  # 先取:收起后会被清零
+        up = self._play_window_up()
+        if up:
+            self._play_end()
+            if fb:
+                self.set_status("正在播放预览…")
+                self.after(1200, self._play_clear_status)
+            return
+        if up is None:
+            # 拿不到窗口句柄(非 Windows / 被拦截)→ 不给假进度,立即收起
+            self._play_end()
+            return
+        el = time.time() - t0
+        if proc.poll() is not None or el > timeout:
+            timed_out = el > timeout
+            self._play_end()
+            if fb:
+                self.set_status("")
+            if timed_out:
+                self.log("等待播放窗口超时(%.1fs) —— 播放器可能未能启动" % el)
+                messagebox.showwarning(
+                    "播放未启动",
+                    "等待播放器窗口超过 %.0f 秒仍未出现。\n\n"
+                    "可能原因:素材编码/分辨率较重导致首帧解码慢,"
+                    "或播放器被安全软件拦截。\n"
+                    "可在控制栏尝试勾选「硬件加速解码」后重试。" % timeout)
+            return
+        if el > 1.5 and fb:
+            self._prog_set(0, "播放器启动中… 已等待 %.1fs" % el)
+            self.set_status("播放器启动中… 已等待 %.1fs(大素材首帧解码较慢)" % el)
+        self._play_poll = self.after(120, lambda: self._play_watch(proc, t0, timeout))
 
     # ================= 精确设置 =================
     def open_precise_dialog(self):
@@ -2215,6 +2383,7 @@ class App(Tk):
         return [
             self.ffapi.ffmpeg, "-y", "-loglevel", "error", "-stats",
             "-ss", "%.3f" % s, "-to", "%.3f" % e,
+        ] + list(self.ffapi.hw_args) + [
             "-i", src,
             "-vf", vf,
             "-loop", "0",
@@ -2334,7 +2503,7 @@ class App(Tk):
             self._set_export_enabled(False)
         except Exception:
             pass  # 按钮恢复异常不阻断导出
-        self._show_progress(True)
+        self._show_progress(True, "批量导出中…")
         self.set_status("批量导出中… %d 个片段" % len(self.segments))
         q = queue.Queue()
         self._job = (q, "批量导出", d, "批量导出完成", None)
@@ -2406,10 +2575,7 @@ class App(Tk):
                 kind, *vals = q.get_nowait()
                 if kind == "progress":
                     pct = min(100.0, vals[0] / max(self._job_total, 0.001) * 100)
-                    try:
-                        self.prog_bar["value"] = pct
-                    except Exception:
-                        pass
+                    self._prog_set(pct, "批量导出中… %.1f%%" % pct)
                     self.set_status("批量导出中… (%.1f%%)" % pct)
                 elif kind == "seg":
                     i, n, name = vals
@@ -2448,17 +2614,136 @@ class App(Tk):
             pass
         self.after(200, self._batch_poll)
 
-    def _show_progress(self, show):
-        """④:显示/隐藏导出进度条(含取消按钮)"""
-        if show:
-            self.prog_bar["value"] = 0
-            self.prog_bar_frame.pack(fill="x", side="bottom")
-            try:
+    # ========== v13.2 通用任务进度条(导入 / 导出 / 播放共用底部条) ==========
+    # v13.3:占用改为「优先级」制 —— 高优先级可抢占低优先级,反之不抢。
+    #   play(0) < import(1) < export(2):播放只是启动提示,不得打断导入/导出的进度显示。
+    _PROG_PRIORITY = {"play": 0, "import": 1, "export": 2}
+
+    def _prog_begin(self, owner, text="", determinate=True, cancelable=False):
+        """显示任务进度条。owner 标识占用者,避免任务之间互相误关。"""
+        cur = getattr(self, "_prog_owner", None)
+        if cur is not None and cur != owner:
+            if self._PROG_PRIORITY.get(cur, 9) > self._PROG_PRIORITY.get(owner, 9):
+                return  # 已有更高优先级任务在用,不抢占
+        self._prog_owner = owner
+        try:
+            self.prog_lbl.config(text=text)
+        except Exception:
+            pass
+        try:
+            self.prog_bar.stop()
+        except Exception:
+            pass
+        try:
+            if determinate:
+                self.prog_bar.config(mode="determinate")
+                self.prog_bar["value"] = 0
+            else:
+                # 未知总量(如 ffprobe 解析)→ 不确定模式来回滚动,表示"正在忙"
+                self.prog_bar.config(mode="indeterminate")
+                self.prog_bar.start(14)
+        except Exception:
+            pass
+        try:
+            if cancelable:
+                self.btn_cancel.pack(side="left", padx=(10, 0), pady=7)
                 self.btn_cancel.config(state="normal")
+            else:
+                self.btn_cancel.pack_forget()
+        except Exception:
+            pass
+        try:
+            self.prog_bar_frame.pack(fill="x", side="bottom")
+        except Exception:
+            pass
+
+    def _prog_set(self, value, text=None):
+        """更新确定型进度条(不确定模式下忽略数值,只更新文字)"""
+        if text is not None:
+            try:
+                self.prog_lbl.config(text=text)
             except Exception:
                 pass
-        else:
+        try:
+            if str(self.prog_bar.cget("mode")) == "determinate":
+                self.prog_bar["value"] = max(0.0, min(100.0, float(value)))
+        except Exception:
+            pass
+
+    def _prog_end(self, owner):
+        """结束任务:仅当 owner 与当前占用者一致时才隐藏(防误关)"""
+        if getattr(self, "_prog_owner", None) != owner:
+            return
+        self._prog_owner = None
+        try:
+            self.prog_bar.stop()
+        except Exception:
+            pass
+        try:
             self.prog_bar_frame.pack_forget()
+        except Exception:
+            pass
+
+    # ========== v13.2 预览"解码中"活动指示 ==========
+    # 抽帧受 ffmpeg 进程启动开销主导(数百毫秒),拖动播放头时尤其明显。
+    # 这里在人眼可感知的延迟(>250ms)后浮出指示,避免快速抽帧时闪烁。
+    def _grab_begin(self):
+        self._grab_inflight = getattr(self, "_grab_inflight", 0) + 1
+        if self._grab_inflight == 1:
+            self._grab_t0 = time.time()
+            self._grab_tick()
+
+    def _grab_tick(self):
+        if getattr(self, "_grab_inflight", 0) <= 0:
+            self._grab_poll = None
+            self._pv_busy_set(False)
+            return
+        if (not self._pv_busy
+                and time.time() - getattr(self, "_grab_t0", 0) >= 0.25):
+            self._pv_busy_set(True)
+        self._grab_poll = self.after(120, self._grab_tick)
+
+    def _grab_end(self):
+        self._grab_inflight = max(0, getattr(self, "_grab_inflight", 0) - 1)
+
+    def _pv_busy_set(self, on):
+        """显示/隐藏预览解码指示(带动画点,给"正在忙"的直观反馈)"""
+        on = bool(on)
+        if on == self._pv_busy:
+            return  # 状态未变,避免重复 place / 重启动画
+        self._pv_busy = on
+        try:
+            if on:
+                self._pv_busy_dots = 0
+                self.pv_busy.place(x=10, y=10)
+                self._pv_busy_anim()
+            else:
+                if self._pv_busy_after:
+                    try:
+                        self.after_cancel(self._pv_busy_after)
+                    except Exception:
+                        pass
+                    self._pv_busy_after = None
+                self.pv_busy.place_forget()
+        except Exception:
+            pass
+
+    def _pv_busy_anim(self):
+        if not self._pv_busy:
+            return
+        self._pv_busy_dots = (self._pv_busy_dots + 1) % 4
+        try:
+            self.pv_busy.config(text="◌ 解码中" + "." * self._pv_busy_dots)
+        except Exception:
+            return
+        self._pv_busy_after = self.after(320, self._pv_busy_anim)
+
+    def _show_progress(self, show, text="导出中…"):
+        """④:显示/隐藏导出进度条(含取消按钮);text 为左侧任务名"""
+        if show:
+            self._prog_begin("export", text, determinate=True, cancelable=True)
+        else:
+            self._prog_end("export")
 
     def cancel_job(self):
         """④:取消当前导出(kill ffmpeg 进程)"""
@@ -2473,7 +2758,7 @@ class App(Tk):
             self.btn_cancel.config(state="disabled")
         except Exception:
             pass
-        self.set_status("正在取消导出…")
+        self.set_status("正在取消任务…")
 
     def _run_job(self, cmd, label, out, done_msg, cleanup=None, total=None,
                  timeout=3600):
@@ -2485,7 +2770,7 @@ class App(Tk):
             self._set_export_enabled(False)
         except Exception:
             pass  # 即使按钮状态异常也绝不阻断导出线程
-        self._show_progress(True)
+        self._show_progress(True, "%s中…" % label)
         self.set_status("%s中… %s" % (label, os.path.basename(out)))
         self.log("── %s ──\n命令: %s" % (label, " ".join(cmd)))
         # 跨线程安全:worker 线程绝不直接调用 Tk(会抛 RuntimeError),
@@ -2559,10 +2844,7 @@ class App(Tk):
                     sec = vals[0]
                     total = max(self._job_total, 0.001)
                     pct = min(100.0, sec / total * 100)
-                    try:
-                        self.prog_bar["value"] = pct
-                    except Exception:
-                        pass
+                    self._prog_set(pct, "%s中… %.1f%%" % (label, pct))
                     self.set_status(
                         "%s中… %s (%.1f%%)"
                         % (label, os.path.basename(out), pct))
@@ -2645,8 +2927,8 @@ class App(Tk):
         def play_it():
             dlg.destroy()
             if self.ffapi and self.ffapi.has_ffplay:
-                cmd = [self.ffapi.ffplay, "-autoexit", "-window_title",
-                       "导出结果预览", "-i", out]
+                cmd = ([self.ffapi.ffplay, "-autoexit", "-window_title",
+                        "导出结果预览"] + list(self.ffapi.hw_args) + ["-i", out])
                 try:
                     speed = float((self.speed_var.get() or "1x").rstrip("x"))
                     if speed > 0 and speed != 1.0:
@@ -2696,14 +2978,29 @@ class App(Tk):
 
 
 def ttk_progressbar(parent, length, maximum):
-    """深色进度条(ttk 的默认样式在深色下也清晰,保持系统组件)"""
+    """自绘深色进度条。
+    系统默认样式(vista)的填充是绿色,在 OBS 深色蓝调界面里很突兀;
+    改用 default 主题 + 自定义颜色,填充取琥珀色(语义配色"主操作/进度"),
+    深底高对比,色弱用户也清晰。本程序只有进度条用 ttk,故切主题无副作用。"""
     from tkinter import ttk
     style = ttk.Style()
     try:
-        style.theme_use("vista")
+        style.theme_use("default")
     except Exception:
         pass
-    return ttk.Progressbar(parent, length=length, maximum=maximum)
+    try:
+        style.configure(
+            "WB.Horizontal.TProgressbar",
+            troughcolor=COL_ENTRY, bordercolor=COL_BORDER,
+            background=COL_PROGRESS, lightcolor=COL_PROGRESS,
+            darkcolor=COL_PROGRESS, thickness=16, borderwidth=1,
+        )
+        style.map("WB.Horizontal.TProgressbar",
+                  background=[("disabled", COL_WIDGET_DISABLED)])
+    except Exception:
+        pass
+    return ttk.Progressbar(parent, length=length, maximum=maximum,
+                           style="WB.Horizontal.TProgressbar")
 
 
 def _argv_video_path(argv):
