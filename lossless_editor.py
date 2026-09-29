@@ -64,6 +64,9 @@ def bundle_zip():
 FFMPEG_ZIP_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 FFMPEG_MANUAL_URL = "https://www.gyan.dev/ffmpeg/builds/"
 
+# 应用版本号(用于崩溃日志 / 会话标记;与 CHANGELOG 保持一致)
+APP_VERSION = "13.8"
+
 # --------------------------------------------------------------------------
 # OBS Studio 深色主题色板
 # --------------------------------------------------------------------------
@@ -163,17 +166,77 @@ def run_capture(cmd, timeout=60):
         return -1, b"", str(e).encode("utf-8", "replace")
 
 
-def _safe_crash(stage, exc):
-    """线程安全的崩溃日志(writer 线程/worker 线程的异常主线程钩子看不到)"""
+# --------------------------------------------------------------------------
+# 异常崩溃日志:统一把未捕获异常写入 APP_DIR/crash.log,并附带应用上下文
+# (当前操作 / 视频路径 / 时长 / 播放头 / 选区 / 硬件加速 等),便于追源崩溃原因。
+# 覆盖三条异常路径:
+#   * 主线程未捕获异常 (sys.excepthook)
+#   * Tk 回调异常 (app.report_callback_exception)
+#   * 后台 worker 线程异常 (threading.excepthook)
+# 另:崩溃守护进程 (watchdog) 检测到主进程异常退出时也会在日志里记一笔,
+# 配合排查「为什么程序闪退/自动重启」。
+# --------------------------------------------------------------------------
+_APP_INSTANCE = None  # main() 里 App() 创建后写入,崩溃日志读取上下文用
+
+
+def _crash_context():
+    """读取当前应用状态,拼成一段可读的上下文信息(任何异常都包 try)"""
+    app = _APP_INSTANCE
+    if app is None:
+        return "context: 应用尚未完成初始化"
+    try:
+        items = []
+        op = getattr(app, "_prog_owner", None)
+        items.append("op=%s" % (op if op else ("busy" if getattr(app, "busy", False) else "idle")))
+        vid = getattr(app, "video", None)
+        items.append("video=%s" % (vid if vid else "(none)"))
+        items.append("duration=%.3f" % getattr(app, "duration", 0.0))
+        items.append("playhead=%.3f" % getattr(app, "playhead_t", 0.0))
+        items.append("sel=[%.3f, %.3f]" % (
+            getattr(app, "start_t", 0.0), getattr(app, "end_t", 0.0)))
+        items.append("segments=%d" % len(getattr(app, "segments", []) or []))
+        cfg = getattr(app, "cfg", {}) or {}
+        items.append("hwaccel=%s" % cfg.get("hwaccel"))
+        items.append("ffapi=%s" % ("ready" if getattr(app, "ffapi", None) else "none"))
+        return "context: " + " | ".join(items)
+    except Exception as e:
+        return "context: (读取失败: %s)" % e
+
+
+def _write_crash(where, stage, et, ev, etb):
+    """统一写一条崩溃记录(带时间戳 + 上下文 + 线程名 + 完整 traceback)。
+    日志超过 2MB 时裁剪掉早期内容,避免无限膨胀。"""
     try:
         import traceback as _tb
-        with open(os.path.join(APP_DIR, "crash.log"), "a",
-                  encoding="utf-8") as f:
-            f.write("[%s] %s\n%s\n" % (
-                time.strftime("%Y-%m-%d %H:%M:%S"), stage,
-                "".join(_tb.format_exception(type(exc), exc, exc.__traceback__))))
+        logp = os.path.join(APP_DIR, "crash.log")
+        try:
+            if os.path.getsize(logp) > 2_000_000:
+                with open(logp, "r", encoding="utf-8", errors="replace") as fh:
+                    data = fh.read()
+                with open(logp, "w", encoding="utf-8") as fh:
+                    fh.write("... [早期日志已截断] ...\n" + data[-1_000_000:])
+        except Exception:
+            pass
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        head = "[%s] CRASH @ %s" % (ts, where)
+        if stage:
+            head += " — %s" % stage
+        block = (
+            "=" * 78 + "\n"
+            + head + "\n"
+            + _crash_context() + "\n"
+            + "thread: %s\n" % threading.current_thread().name
+            + "".join(_tb.format_exception(et, ev, etb))
+        )
+        with open(logp, "a", encoding="utf-8") as f:
+            f.write(block + "\n")
     except Exception:
         pass
+
+
+def _safe_crash(stage, exc):
+    """线程安全的崩溃日志(writer 线程/worker 线程的异常主线程钩子看不到)"""
+    _write_crash("WORKER THREAD", stage, type(exc), exc, exc.__traceback__)
 
 
 # --------------------------------------------------------------------------
@@ -228,6 +291,18 @@ def _watchdog_main(pid):
             try:
                 os.remove(CRASH_MARKER)
             except OSError:
+                pass
+            # 异常退出 → 在崩溃日志里记一笔(配合上方 CRASH 记录追源原因)
+            try:
+                ts = time.strftime("%Y-%m-%d %H:%M:%S")
+                with open(os.path.join(APP_DIR, "crash.log"), "a",
+                          encoding="utf-8") as f:
+                    f.write(
+                        "\n" + "=" * 78 + "\n"
+                        + "[%s] WATCHDOG: 主进程(pid=%d)异常退出,已自动重启\n"
+                        % (ts, pid)
+                        + "context: 见上方最近一条 CRASH 记录以确定崩溃原因\n")
+            except Exception:
                 pass
             # 异常退出 → 自动重启
             try:
@@ -525,6 +600,9 @@ class Timeline(Canvas):
                 text="打开视频后,可在此拖动选择裁剪区间",
                 fill=COL_TEXT_FAINT, font=app.font_small,
             )
+            sb = getattr(self.app, "seek_bar", None)
+            if sb is not None:
+                sb.draw()
             return
         w = self.winfo_width()
         x0, x1 = self.t_to_x(app.start_t), self.t_to_x(app.end_t)
@@ -557,6 +635,10 @@ class Timeline(Canvas):
         # 手柄
         self._draw_handle(x0, COL_START)
         self._draw_handle(x1, COL_END)
+        # 双向同步预览区进度条
+        sb = getattr(self.app, "seek_bar", None)
+        if sb is not None:
+            sb.draw()
 
     def _draw_handle(self, x, color):
         y0 = 28
@@ -682,9 +764,7 @@ class App(Tk):
         self._proc = None
         self._cancel_flag = False
         # v13.2 通用任务进度条(导入/导出共用底部条)与预览活动指示
-        self._prog_owner = None      # 当前占用进度条的任务: export / import / play
-        self._play_poll = None       # v13.3 播放启动轮询 after id
-        self._play_feedback = False  # v13.3 本次播放是否拿到了进度条(未拿到则不抢状态栏)
+        self._prog_owner = None      # 当前占用进度条的任务: export / import
         self._grab_inflight = 0      # 在途的预览抽帧数
         self._grab_t0 = 0.0          # 本轮抽帧起始时间(用于延迟显示)
         self._grab_poll = None       # 抽帧活动指示的轮询 after id
@@ -870,6 +950,7 @@ class App(Tk):
         self.cv.bind("<ButtonPress-1>", self._on_pv_press)
         self.cv.bind("<B1-Motion>", self._on_pv_drag)
         self.cv.bind("<ButtonRelease-1>", self._on_pv_release)
+
 
         # 视频信息条(①:分辨率/编码/帧率/音频/大小/时长)
         self.info_bar = Frame(left, bg=COL_PANEL)
@@ -1775,20 +1856,19 @@ class App(Tk):
 
     # ================= 播放预览 =================
     def play_selection(self):
+        """「播放选区」:调用 ffplay 独立窗口播放框选的那一段(起点 → 终点)。
+
+        画面由 ffplay 渲染(流畅、支持高码率);本工具不做自定义进度条 / 控制窗,
+        进度与暂停由 ffplay 窗口自身提供。"""
         if not self.ffapi or not self.ffapi.has_ffplay:
-            messagebox.showwarning("提示", "当前 ffmpeg 版本未附带 ffplay 播放器,\n无法播放预览。")
+            messagebox.showwarning("提示",
+                "当前 ffmpeg 版本未附带 ffplay 播放器,\n无法播放预览。")
             return
         if not self.video:
             messagebox.showinfo("提示", "请先打开一个视频文件,再使用「播放选区」。")
             return
-        # v13.4:「播放选区」= 播放**框选的那一段**,永远从选区起点播到选区终点。
-        # v13.3 及以前写作 start = max(播放头, 选区起点):只要用户在时间轴上点过一下
-        # (移动播放头做单帧预览),播放就从那个"插针"位置开始,而不是框选范围的起点,
-        # 与按钮语义不符(用户报的正是这个)。
-        start = self.start_t
-        end = self.end_t
+        start, end = self.start_t, self.end_t
         if end - start < 0.001:
-            # v13.3:以前这里是静默 return —— 用户会以为"点了没反应"。
             messagebox.showinfo(
                 "提示", "当前选区为空(起点 = 终点),没有可播放的内容。\n\n"
                         "请在时间轴上拖出端点、框选一段区间后重试。")
@@ -1801,97 +1881,18 @@ class App(Tk):
             "-t", "%.3f" % (end - start),
             "-i", self.video,
         ]
-        # v10:播放速度(0.5x / 1x / 2x,ffplay 的 -speed 参数)
         try:
             speed = float((self.speed_var.get() or "1x").rstrip("x"))
             if speed > 0 and speed != 1.0:
                 cmd = cmd[:1] + ["-speed", "%.2f" % speed] + cmd[1:]
         except (ValueError, AttributeError):
             pass
-        # v13.3:ffplay 是独立进程,从 Popen 到窗口真正出现有 0.5~3s 延迟
-        #        (进程启动 + seek + 首帧解码),期间界面毫无反馈 → 显得"点了没反应"。
-        #        这里立刻给出进度条 + 状态栏,窗口一出现就自动收起。
-        self._play_begin()
-        try:
-            proc = subprocess.Popen(cmd, creationflags=CREATE_NO_WINDOW)
-        except Exception as e:
-            self._play_end()
-            messagebox.showerror("播放失败", "无法启动 ffplay:\n%s" % e)
-            return
-        self._play_watch(proc, time.time())
         self.log("播放选区: %s → %s (选区范围, %s)"
                  % (fmt_time(start), fmt_time(end), self.speed_var.get() or "1x"))
-
-    # ---- v13.3 播放启动反馈 ----
-    def _play_begin(self):
-        """请求进度条(导出进行中时不抢占);记录是否拿到,用于决定能否改状态栏"""
-        self._prog_begin("play", "正在启动播放器…",
-                         determinate=False, cancelable=False)
-        self._play_feedback = (getattr(self, "_prog_owner", None) == "play")
-        if self._play_feedback:
-            self.set_status("正在启动播放器…")
-
-    def _play_end(self):
-        if getattr(self, "_play_poll", None):
-            try:
-                self.after_cancel(self._play_poll)
-            except Exception:
-                pass
-            self._play_poll = None
-        self._prog_end("play")
-        self._play_feedback = False
-
-    def _play_window_up(self):
-        """检测 ffplay 的「无损预览」窗口是否已创建(ctypes,零第三方依赖)"""
         try:
-            return bool(ctypes.windll.user32.FindWindowW(None, "无损预览"))
-        except Exception:
-            return None  # 检测不可用 → 交由定时兜底
-
-    def _play_clear_status(self):
-        """清空状态栏,但绝不覆盖导出等其他任务的状态文字"""
-        if getattr(self, "_prog_owner", None) is None:
-            self.set_status("")
-
-    def _play_watch(self, proc, t0, timeout=20.0):
-        """轮询播放窗口:出现即收起反馈;进程结束/超时也收起,绝不留悬挂进度条"""
-        if getattr(self, "_play_poll", None):
-            try:
-                self.after_cancel(self._play_poll)
-            except Exception:
-                pass
-            self._play_poll = None
-        fb = bool(getattr(self, "_play_feedback", False))  # 先取:收起后会被清零
-        up = self._play_window_up()
-        if up:
-            self._play_end()
-            if fb:
-                self.set_status("正在播放预览…")
-                self.after(1200, self._play_clear_status)
-            return
-        if up is None:
-            # 拿不到窗口句柄(非 Windows / 被拦截)→ 不给假进度,立即收起
-            self._play_end()
-            return
-        el = time.time() - t0
-        if proc.poll() is not None or el > timeout:
-            timed_out = el > timeout
-            self._play_end()
-            if fb:
-                self.set_status("")
-            if timed_out:
-                self.log("等待播放窗口超时(%.1fs) —— 播放器可能未能启动" % el)
-                messagebox.showwarning(
-                    "播放未启动",
-                    "等待播放器窗口超过 %.0f 秒仍未出现。\n\n"
-                    "可能原因:素材编码/分辨率较重导致首帧解码慢,"
-                    "或播放器被安全软件拦截。\n"
-                    "可在控制栏尝试勾选「硬件加速解码」后重试。" % timeout)
-            return
-        if el > 1.5 and fb:
-            self._prog_set(0, "播放器启动中… 已等待 %.1fs" % el)
-            self.set_status("播放器启动中… 已等待 %.1fs(大素材首帧解码较慢)" % el)
-        self._play_poll = self.after(120, lambda: self._play_watch(proc, t0, timeout))
+            subprocess.Popen(cmd, creationflags=CREATE_NO_WINDOW)
+        except Exception as e:
+            messagebox.showerror("播放失败", "无法启动 ffplay:\n%s" % e)
 
     # ================= 精确设置 =================
     def open_precise_dialog(self):
@@ -3035,36 +3036,42 @@ def main():
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
         except Exception:
             pass
-    # 打包版把未捕获异常写入 crash.log(便于定位问题)
-    if getattr(sys, "frozen", False):
-        try:
-            import traceback as _tb
-
-            def _hook(et, ev, etb):
-                try:
-                    with open(os.path.join(APP_DIR, "crash.log"), "a",
-                              encoding="utf-8") as f:
-                        f.write("".join(_tb.format_exception(et, ev, etb)))
-                except Exception:
-                    pass
-                sys.__excepthook__(et, ev, etb)
-            sys.excepthook = _hook
-        except Exception:
-            pass
+    # 崩溃日志:未捕获异常 / Tk 回调异常 / 后台线程异常 统一写入 crash.log
+    # (源码运行与打包运行都启用,便于开发期直接复现崩溃)
+    try:
+        sys.excepthook = lambda et, ev, etb: _write_crash(
+            "MAIN THREAD", None, et, ev, etb)
+    except Exception:
+        pass
+    try:
+        threading.excepthook = lambda args: _write_crash(
+            "WORKER THREAD", None,
+            args.exc_type, args.exc_value, args.exc_traceback)
+    except Exception:
+        pass
     _start_watchdog()  # v10:拉起崩溃守护进程(异常退出自动重启)
     app = App()
+    global _APP_INSTANCE
+    _APP_INSTANCE = app
     # 拖文件到 exe 图标上启动(命令行传入路径)→ 自动加载
     app._pending_open = _argv_video_path(sys.argv)
     # tkinter 回调异常也写日志
-    def _report(exc, val, tb):
-        try:
-            import traceback as _tb2
-            with open(os.path.join(APP_DIR, "crash.log"), "a",
-                      encoding="utf-8") as f:
-                f.write("".join(_tb2.format_exception(exc, val, tb)))
-        except Exception:
-            pass
-    app.report_callback_exception = _report
+    app.report_callback_exception = lambda et, ev, etb: _write_crash(
+        "TK CALLBACK", None, et, ev, etb)
+    # 会话起始标记(便于把同一次运行的崩溃记录归组)
+    try:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(os.path.join(APP_DIR, "crash.log"), "a", encoding="utf-8") as f:
+            f.write(
+                "\n" + "=" * 78 + "\n"
+                + "[%s] SESSION START  version=%s  pid=%d\n"
+                % (ts, APP_VERSION, os.getpid())
+                + "python=%s  frozen=%s  cwd=%s\n"
+                % (sys.version.split()[0], getattr(sys, "frozen", False),
+                   os.getcwd())
+                + "argv=%s\n" % " ".join(sys.argv))
+    except Exception:
+        pass
     app.mainloop()
     # PyInstaller onefile 打包版在窗口关闭后偶发挂起(源码版无此问题)。
     # 用 sys.exit(0) 走正常清理路径退出,确保 bootloader 父进程同步退出,

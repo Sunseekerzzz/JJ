@@ -13,6 +13,7 @@ releases/
 
 # ---- Runtime state / logs ----
 crash*.log
+crash_marker.txt
 crash_count.txt
 smoke_result.txt
 build_v6_log.txt
